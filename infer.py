@@ -243,6 +243,7 @@ def run_inference(audio_path, model_path=None):
     # Locate checkpoint
     if model_path is None:
         possible_paths = [
+            Path("./trained_models/voice_deepfake_detector.pth"),
             Path("/kaggle/working/voice_deepfake_detector/voice_deepfake_detector.pth"),
             Path("./voice_deepfake_detector.pth"),
             Path("./checkpoints/best_voice_deepfake_model.pth"),
