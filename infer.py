@@ -210,9 +210,53 @@ class MultiDomainDeepfakeDetector(nn.Module):
 # ------------------------------------------------------------
 
 def load_audio_file(path):
-    audio, sr = sf.read(path, dtype="float32", always_2d=False)
-    if audio.ndim == 2:
-        audio = np.mean(audio, axis=1)
+    """
+    Load audio from file with multi-backend fallback:
+    1. soundfile (WAV, FLAC, OGG, etc.)
+    2. torchaudio (M4A, AAC, MP3, etc.)
+    3. ffmpeg subprocess (any audio/video format)
+    """
+    audio, sr = None, None
+
+    # Backend 1: soundfile
+    try:
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+        if audio.ndim == 2:
+            audio = np.mean(audio, axis=1)
+    except Exception:
+        pass
+
+    # Backend 2: torchaudio
+    if audio is None:
+        try:
+            import torchaudio
+            waveform, sr = torchaudio.load(str(path))
+            if waveform.ndim == 2 and waveform.shape[0] > 1:
+                audio = waveform.mean(dim=0).cpu().numpy()
+            else:
+                audio = waveform.squeeze().cpu().numpy()
+        except Exception:
+            pass
+
+    # Backend 3: ffmpeg subprocess
+    if audio is None:
+        try:
+            import subprocess
+            cmd = [
+                "ffmpeg", "-nostdin", "-v", "error",
+                "-i", str(path),
+                "-f", "f32le",
+                "-ac", "1",
+                "-ar", str(SAMPLE_RATE),
+                "pipe:1"
+            ]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            audio = np.frombuffer(proc.stdout, dtype=np.float32)
+            sr = SAMPLE_RATE
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load audio file '{path}'. Supported formats include .wav, .mp3, .m4a, .aac, .flac, .ogg. Details: {e}"
+            )
 
     audio = np.asarray(audio, dtype=np.float32)
     audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
@@ -239,6 +283,14 @@ def load_audio_file(path):
 
 def run_inference(audio_path, model_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if audio_path is None or str(audio_path).startswith("-") or str(audio_path).endswith(".json"):
+        raise ValueError(
+            f"Invalid audio path: '{audio_path}'. Please pass a valid path to an audio file (e.g. run_inference('sample.wav'))."
+        )
+
+    if not Path(audio_path).exists():
+        raise FileNotFoundError(f"Audio file not found: '{audio_path}'")
 
     # Locate checkpoint
     if model_path is None or str(model_path).endswith(".json"):
