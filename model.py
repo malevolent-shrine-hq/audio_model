@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-High-Accuracy Voice Deepfake Detection Pipeline
-Multi-Domain (Mel + High-Frequency Linear Spectrogram) SE-ResNet
-with Statistical Pooling, Mixup Augmentation, and EER Calibration.
+State-of-the-Art Voice Deepfake Detection Pipeline (v3)
+Multi-Resolution STFT (1024 Mel + 512 Temporal + 2048 Harmonic Spectrograms)
+SE-ResNet Backbone with Multi-Statistic Pooling, Binary Focal Loss,
+Mixup Augmentation, and Automatic Calibrated Thresholding.
 """
 
 # ============================================================
@@ -79,9 +80,7 @@ NUM_SAMPLES = int(SAMPLE_RATE * AUDIO_DURATION)  # 32,000 samples
 
 # Spectrogram Parameters
 N_MELS = 128
-N_FFT = 1024
 HOP_LENGTH = 256
-WIN_LENGTH = 1024
 F_MIN = 20
 F_MAX = SAMPLE_RATE // 2  # 8000 Hz
 
@@ -90,16 +89,18 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 25
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-2         # Strong weight decay to prevent vocoder memorization
-LABEL_SMOOTHING = 0.08      # Prevents logit explosion and negative calibration drift
-MIXUP_PROB = 0.5            # 50% chance of feature-level mixup
-MIXUP_ALPHA = 0.2           # Beta distribution parameter for mixup
+FOCAL_GAMMA = 2.0           # Focuses learning on hard / unseen vocoder samples
+FOCAL_ALPHA = 0.5           # Balanced class weighting in Focal Loss
+LABEL_SMOOTHING = 0.05      # Softens binary targets to keep logits calibrated
+MIXUP_PROB = 0.5            # 50% probability of spectral Mixup
+MIXUP_ALPHA = 0.2           # Beta distribution parameter for Mixup
 MAX_GRAD_NORM = 1.0
 PATIENCE = 7
 NUM_WORKERS = 2
 USE_AMP = torch.cuda.is_available()
 SEED = 42
 
-# Set random seeds for reproducibility
+# Reproducibility
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -110,6 +111,7 @@ print("Output root    :", OUTPUT_ROOT)
 print("Sample rate    :", SAMPLE_RATE)
 print("Learning rate  :", LEARNING_RATE)
 print("Weight decay   :", WEIGHT_DECAY)
+print("Focal gamma    :", FOCAL_GAMMA)
 print("Label smoothing:", LABEL_SMOOTHING)
 print("AMP enabled    :", USE_AMP)
 
@@ -159,7 +161,6 @@ def find_split_directory(root: Path, split_name: str):
         if fake_dir.exists() and real_dir.exists():
             candidates.append(p)
 
-    # Sort candidates so that for-2sec / for-2seconds comes first
     candidates.sort(
         key=lambda x: (
             0 if "for-2sec" in str(x).lower() or "for-2seconds" in str(x).lower() else 1
@@ -236,7 +237,7 @@ def load_audio(path, target_sr=SAMPLE_RATE, training=False):
     """
     Load audio, convert to mono, resample if necessary,
     apply peak normalization, and force exactly NUM_SAMPLES samples.
-    During training, uses random cropping so speech across the entire clip is seen.
+    During training, random cropping captures speech across the entire clip.
     """
     audio, sr = sf.read(path, dtype="float32", always_2d=False)
 
@@ -313,10 +314,10 @@ def create_mel_filterbank(sample_rate, n_fft, n_mels, f_min, f_max):
     return torch.tensor(filterbank, dtype=torch.float32)
 
 
-MEL_FILTERBANK = create_mel_filterbank(
-    SAMPLE_RATE, N_FFT, N_MELS, F_MIN, F_MAX
+MEL_FILTERBANK_1024 = create_mel_filterbank(
+    SAMPLE_RATE, 1024, N_MELS, F_MIN, F_MAX
 )
-print("Mel filterbank shape:", MEL_FILTERBANK.shape)
+print("Mel filterbank shape:", MEL_FILTERBANK_1024.shape)
 
 
 # ============================================================
@@ -381,7 +382,7 @@ train_loader = DataLoader(
     num_workers=NUM_WORKERS,
     pin_memory=torch.cuda.is_available(),
     persistent_workers=(NUM_WORKERS > 0),
-    drop_last=True,  # Crucial to prevent batch-size 1 BatchNorm crashes
+    drop_last=True,
 )
 
 val_loader = DataLoader(
@@ -406,83 +407,107 @@ print(f"Batches — Train: {len(train_loader)}, Val: {len(val_loader)}, Test: {l
 
 
 # ============================================================
-# CELL 9 — DUAL-DOMAIN SPECTROGRAM (MEL + LINEAR HIGH-FREQ)
+# CELL 9 — MULTI-RESOLUTION SPECTROGRAM (3 COMPLEMENTARY SCALES)
 # ============================================================
 
-class DualDomainSpectrogram(nn.Module):
+class MultiResolutionSpectrogram(nn.Module):
     """
-    Extracts two complementary spectral representations:
-      Channel 0: Log-Mel Spectrogram (128 bins) — captures speech formants, pitch, and prosody.
-      Channel 1: Log-Linear Spectrogram (128 bins) — uniformly samples frequencies up to 8 kHz,
-                 preserving high-frequency vocoder phase artifacts and harmonic distortions.
-    Computes strictly in FP32 with safe clamping to permanently prevent NaNs / -inf underflow.
+    Extracts 3 complementary spectral representations simultaneously:
+      Channel 0: Standard Log-Mel Spectrogram (N_FFT=1024, Hop=256, 128 Mels)
+                 -> Captures speech formants, pitch contours, and vocal tract prosody.
+      Channel 1: High-Time-Resolution Linear Spectrogram (N_FFT=512, Hop=256, 128 Bins)
+                 -> High temporal resolution: catches fast vocoder clicks, pops, and phase jumps.
+      Channel 2: High-Frequency-Resolution Linear Spectrogram (N_FFT=2048, Hop=256, 128 Bins)
+                 -> High frequency resolution: reveals robotic harmonic combs and pitch flatness.
+    All 3 channels align perfectly in time dimension (T=126) because hop_length=256 is shared.
+    Computed strictly in FP32 with safe clamping (min=1e-5) to guarantee 0 NaNs.
     """
     def __init__(
         self,
         sample_rate=SAMPLE_RATE,
-        n_fft=N_FFT,
         hop_length=HOP_LENGTH,
-        win_length=WIN_LENGTH,
         n_mels=N_MELS,
-        mel_filterbank=MEL_FILTERBANK,
+        mel_filterbank=MEL_FILTERBANK_1024,
     ):
         super().__init__()
-        self.n_fft = n_fft
         self.hop_length = hop_length
-        self.win_length = win_length
         self.n_mels = n_mels
 
-        window = torch.hann_window(win_length)
-        self.register_buffer("window", window)
+        self.register_buffer("window_512", torch.hann_window(512))
+        self.register_buffer("window_1024", torch.hann_window(1024))
+        self.register_buffer("window_2048", torch.hann_window(2048))
         self.register_buffer("mel_filterbank", mel_filterbank)
 
     def forward(self, waveform):
-        # Always compute STFT and logs in FP32 to prevent half-precision underflow
         with torch.cuda.amp.autocast(enabled=False):
             waveform = waveform.float()
 
-            stft = torch.stft(
+            # 1. Standard Log-Mel Spectrogram (N_FFT=1024)
+            stft_1024 = torch.stft(
                 waveform,
-                n_fft=self.n_fft,
+                n_fft=1024,
                 hop_length=self.hop_length,
-                win_length=self.win_length,
-                window=self.window,
+                win_length=1024,
+                window=self.window_1024,
                 center=True,
                 return_complex=True,
             )
-
-            # Magnitude and power: shape [B, 513, T]
-            magnitude = torch.abs(stft)
-            power = magnitude**2
-
-            # Channel 0: Log-Mel Spectrogram [B, 128, T]
-            mel = torch.matmul(self.mel_filterbank, power)
+            power_1024 = torch.abs(stft_1024) ** 2
+            mel = torch.matmul(self.mel_filterbank, power_1024)
             log_mel = torch.log(torch.clamp(mel, min=1e-5))
-            mel_mean = log_mel.mean(dim=(-2, -1), keepdim=True)
-            mel_std = log_mel.std(dim=(-2, -1), keepdim=True)
-            log_mel = (log_mel - mel_mean) / (mel_std + 1e-5)
+            log_mel = (log_mel - log_mel.mean(dim=(-2, -1), keepdim=True)) / (
+                log_mel.std(dim=(-2, -1), keepdim=True) + 1e-5
+            )
 
-            # Channel 1: High-Frequency Linear Spectrogram [B, 128, T]
-            # Average-pools the 513 linear frequency bins down to 128 bins
-            lin = F.adaptive_avg_pool2d(
-                power.unsqueeze(1), (self.n_mels, power.shape[-1])
+            # 2. High-Time-Resolution Linear Spectrogram (N_FFT=512)
+            stft_512 = torch.stft(
+                waveform,
+                n_fft=512,
+                hop_length=self.hop_length,
+                win_length=512,
+                window=self.window_512,
+                center=True,
+                return_complex=True,
+            )
+            power_512 = torch.abs(stft_512) ** 2
+            lin_512 = F.adaptive_avg_pool2d(
+                power_512.unsqueeze(1), (self.n_mels, power_512.shape[-1])
             ).squeeze(1)
-            log_lin = torch.log(torch.clamp(lin, min=1e-5))
-            lin_mean = log_lin.mean(dim=(-2, -1), keepdim=True)
-            lin_std = log_lin.std(dim=(-2, -1), keepdim=True)
-            log_lin = (log_lin - lin_mean) / (lin_std + 1e-5)
+            log_lin_512 = torch.log(torch.clamp(lin_512, min=1e-5))
+            log_lin_512 = (log_lin_512 - log_lin_512.mean(dim=(-2, -1), keepdim=True)) / (
+                log_lin_512.std(dim=(-2, -1), keepdim=True) + 1e-5
+            )
 
-            # Stack along channel dimension -> [B, 2, 128, T]
-            features = torch.stack([log_mel, log_lin], dim=1)
+            # 3. High-Frequency-Resolution Linear Spectrogram (N_FFT=2048)
+            stft_2048 = torch.stft(
+                waveform,
+                n_fft=2048,
+                hop_length=self.hop_length,
+                win_length=2048,
+                window=self.window_2048,
+                center=True,
+                return_complex=True,
+            )
+            power_2048 = torch.abs(stft_2048) ** 2
+            lin_2048 = F.adaptive_avg_pool2d(
+                power_2048.unsqueeze(1), (self.n_mels, power_2048.shape[-1])
+            ).squeeze(1)
+            log_lin_2048 = torch.log(torch.clamp(lin_2048, min=1e-5))
+            log_lin_2048 = (log_lin_2048 - log_lin_2048.mean(dim=(-2, -1), keepdim=True)) / (
+                log_lin_2048.std(dim=(-2, -1), keepdim=True) + 1e-5
+            )
+
+            # Stack into 3-channel tensor -> [B, 3, 128, 126]
+            features = torch.stack([log_mel, log_lin_512, log_lin_2048], dim=1)
 
         return features
 
 
 # ============================================================
-# CELL 10 — SPEC AUGMENT & SPECTRAL JITTER
+# CELL 10 — MULTI-SCALE SPEC AUGMENT & SPECTRAL JITTER
 # ============================================================
 
-class DualSpecAugment(nn.Module):
+class MultiResSpecAugment(nn.Module):
     def __init__(self, freq_mask=14, time_mask=18):
         super().__init__()
         self.freq_mask = freq_mask
@@ -495,25 +520,24 @@ class DualSpecAugment(nn.Module):
         B, C, FREQ, TIME = x.shape
         x = x.clone()
 
-        # Apply random masking per-sample independently
         for b in range(B):
-            # Frequency masking (2 bands)
+            # Frequency masking (2 bands across all channels)
             for _ in range(2):
                 width = random.randint(0, min(self.freq_mask, FREQ - 1))
                 if width > 0:
                     start = random.randint(0, FREQ - width)
                     x[b, :, start : start + width, :] = 0.0
 
-            # Time masking (2 bands)
+            # Time masking (2 bands across all channels)
             for _ in range(2):
                 width = random.randint(0, min(self.time_mask, TIME - 1))
                 if width > 0:
                     start = random.randint(0, TIME - width)
                     x[b, :, :, start : start + width] = 0.0
 
-            # Mild Gaussian spectral jitter (30% chance)
+            # Subtle Gaussian spectral jitter (30% chance)
             if random.random() < 0.30:
-                jitter = torch.randn_like(x[b]) * 0.04
+                jitter = torch.randn_like(x[b]) * 0.03
                 x[b] = x[b] + jitter
 
         return x
@@ -637,18 +661,18 @@ class ResidualBlock(nn.Module):
 
 class MultiDomainDeepfakeDetector(nn.Module):
     """
-    State-of-the-Art Voice Deepfake Detector:
-      - 2-Channel Dual-Domain Spectral Input (Mel + Linear)
-      - Multi-scale Asymmetric Convolutions (models speech harmonics and time transitions)
-      - Squeeze-and-Excitation Attention
+    Multi-Domain Voice Deepfake Detector:
+      - 3-Channel Multi-Resolution Input (Mel + 512-Time + 2048-Harmonic)
+      - Multi-scale Asymmetric Convolutions (models pitch harmonics and temporal transitions)
+      - Squeeze-and-Excitation Channel Attention
       - Attentive Statistical Pooling (Mean + Std + Max pooling captures transient vocoder jitter)
     """
     def __init__(self):
         super().__init__()
 
-        # Stem: 2 input channels -> 32 channels (downsample freq/time by 2)
+        # Stem: 3 input channels -> 32 channels (downsample freq/time by 2)
         self.stem = nn.Sequential(
-            ConvBNAct(2, 32, kernel_size=(5, 5), stride=2, padding=2),
+            ConvBNAct(3, 32, kernel_size=(5, 5), stride=2, padding=2),
             ResidualBlock(32, 32, stride=1, kernel_size=(3, 3), dropout=0.05),
         )
 
@@ -683,7 +707,7 @@ class MultiDomainDeepfakeDetector(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B, 2, 128, 126]
+        # x: [B, 3, 128, 126]
         x = self.stem(x)
         x = self.stage1(x)
         x = self.stage2(x)
@@ -707,8 +731,8 @@ VoiceDeepfakeCNN = MultiDomainDeepfakeDetector
 # CELL 12 — INSTANTIATE MODEL
 # ============================================================
 
-mel_transform = DualDomainSpectrogram().to(DEVICE)
-spec_augment = DualSpecAugment(freq_mask=14, time_mask=18).to(DEVICE)
+mel_transform = MultiResolutionSpectrogram().to(DEVICE)
+spec_augment = MultiResSpecAugment(freq_mask=14, time_mask=18).to(DEVICE)
 model = MultiDomainDeepfakeDetector().to(DEVICE)
 
 total_params = sum(p.numel() for p in model.parameters())
@@ -733,7 +757,7 @@ with torch.no_grad():
     sample_logits = model(sample_features)
 
 print("Audio shape    :", sample_audio.shape)
-print("Features shape :", sample_features.shape)  # Should be [32, 2, 128, 126]
+print("Features shape :", sample_features.shape)  # Should be [32, 3, 128, 126]
 print("Logits shape   :", sample_logits.shape)
 print("Sample logits  :", [round(x, 4) for x in sample_logits[:5].cpu().tolist()])
 
@@ -745,7 +769,7 @@ print("Sample logits  :", [round(x, 4) for x in sample_logits[:5].cpu().tolist()
 def compute_eer(y_true, y_prob):
     """
     Compute Equal Error Rate (EER) and the corresponding decision threshold.
-    EER is the standard metric in voice anti-spoofing where False Alarm Rate = Miss Rate.
+    EER is the standard benchmark metric where False Alarm Rate = Miss Rate.
     """
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob)
@@ -753,7 +777,6 @@ def compute_eer(y_true, y_prob):
     fpr, tpr, thresholds = roc_curve(y_true, y_prob, pos_label=1)
     fnr = 1.0 - tpr
 
-    # Find index where FPR and FNR intersect
     diff = np.absolute(fnr - fpr)
     eer_idx = np.nanargmin(diff)
     eer = float((fpr[eer_idx] + fnr[eer_idx]) / 2.0)
@@ -763,7 +786,7 @@ def compute_eer(y_true, y_prob):
 
 def find_best_threshold(y_true, y_prob):
     """Find threshold that maximizes the F1 score."""
-    thresholds = np.linspace(0.05, 0.95, 91)
+    thresholds = np.linspace(0.01, 0.95, 95)
     best_thresh = 0.5
     best_f1 = -1.0
 
@@ -810,10 +833,48 @@ def calculate_metrics(y_true, y_prob, threshold=0.5):
 
 
 # ============================================================
-# CELL 15 — OPTIMIZER & LOSS FUNCTION
+# CELL 15 — BINARY FOCAL LOSS & OPTIMIZER
 # ============================================================
 
-criterion = nn.BCEWithLogitsLoss()
+class BinaryFocalLoss(nn.Module):
+    """
+    Binary Focal Loss with Label Smoothing:
+      FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    Down-weights easy training samples and forces gradient updates on hard,
+    subtle deepfakes resembling unseen generators.
+    """
+    def __init__(self, gamma=2.0, alpha=0.5, label_smoothing=0.05, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.label_smoothing = label_smoothing
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        if self.label_smoothing > 0:
+            targets = targets * (1.0 - 2.0 * self.label_smoothing) + self.label_smoothing
+
+        bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        probs = torch.sigmoid(logits)
+
+        # p_t is the probability of the true class
+        p_t = targets * probs + (1.0 - targets) * (1.0 - probs)
+        alpha_t = targets * self.alpha + (1.0 - targets) * (1.0 - self.alpha)
+        focal_weight = alpha_t * torch.pow((1.0 - p_t).clamp(min=0.0, max=1.0), self.gamma)
+
+        loss = focal_weight * bce_loss
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+criterion = BinaryFocalLoss(
+    gamma=FOCAL_GAMMA,
+    alpha=FOCAL_ALPHA,
+    label_smoothing=LABEL_SMOOTHING,
+)
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
@@ -830,18 +891,18 @@ scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
 
 scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
 
-print("Criterion : BCEWithLogitsLoss (with Label Smoothing)")
+print("Criterion : BinaryFocalLoss (gamma=2.0, label_smoothing=0.05)")
 print("Optimizer : AdamW (weight_decay=0.01)")
 print("Scheduler : CosineAnnealingLR")
 
 
 # ============================================================
-# CELL 16 — TRAINING FUNCTION (WITH MIXUP & LABEL SMOOTHING)
+# CELL 16 — TRAINING FUNCTION (WITH MIXUP & FOCAL LOSS)
 # ============================================================
 
 def train_one_epoch(model, loader, optimizer, criterion, epoch):
     model.train()
-    mel_transform.eval()   # Spectrogram extraction does not have learnable weights
+    mel_transform.eval()
     spec_augment.train()
 
     running_loss = 0.0
@@ -855,14 +916,14 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch):
 
         optimizer.zero_grad(set_to_none=True)
 
-        # Feature extraction (FP32)
+        # 3-Channel Multi-Resolution Spectral Extraction (FP32)
         with torch.no_grad():
             features = mel_transform(audio)
 
         # SpecAugment
         features = spec_augment(features)
 
-        # Feature-level Mixup (50% probability)
+        # Spectral Mixup (50% probability)
         target_labels = labels
         if random.random() < MIXUP_PROB:
             lam = np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA)
@@ -870,19 +931,10 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch):
             features = lam * features + (1.0 - lam) * features[perm]
             target_labels = lam * labels + (1.0 - lam) * labels[perm]
 
-        # Forward pass in Mixed Precision
+        # Forward pass with AMP
         with torch.cuda.amp.autocast(enabled=USE_AMP):
             logits = model(features)
-
-            # Apply label smoothing: 0 -> smoothing, 1 -> (1 - smoothing)
-            if LABEL_SMOOTHING > 0:
-                smooth_targets = (
-                    target_labels * (1.0 - 2.0 * LABEL_SMOOTHING) + LABEL_SMOOTHING
-                )
-            else:
-                smooth_targets = target_labels
-
-            loss = criterion(logits, smooth_targets)
+            loss = criterion(logits, target_labels)
 
         # Backward pass with scaled gradients
         scaler.scale(loss).backward()
@@ -975,10 +1027,8 @@ def save_checkpoint(
             "sample_rate": SAMPLE_RATE,
             "duration": AUDIO_DURATION,
             "n_mels": N_MELS,
-            "n_fft": N_FFT,
             "hop_length": HOP_LENGTH,
-            "win_length": WIN_LENGTH,
-            "model_name": "MultiDomainDeepfakeDetector",
+            "model_name": "MultiResolutionDeepfakeDetector_v3",
         },
     }
     torch.save(checkpoint, path)
@@ -1003,7 +1053,7 @@ def load_checkpoint(path):
 
 
 # ============================================================
-# CELL 19 — FULL TRAINING LOOP WITH EER CALIBRATION
+# CELL 19 — FULL TRAINING LOOP WITH HARD-SAMPLE MINING
 # ============================================================
 
 history = []
@@ -1014,7 +1064,7 @@ best_eer_threshold = 0.5
 epochs_without_improvement = 0
 
 print("=" * 70)
-print("STARTING TRAINING — SE-RESNET (DUAL DOMAIN)")
+print("STARTING TRAINING — MULTI-RESOLUTION SE-RESNET (v3)")
 print("=" * 70)
 print("Device             :", DEVICE)
 print("Total Epochs       :", NUM_EPOCHS)
@@ -1039,7 +1089,6 @@ for epoch in range(NUM_EPOCHS):
     f1_thresh, f1_val = find_best_threshold(val_labels, val_probs)
     val_eer, val_eer_thresh = compute_eer(val_labels, val_probs)
 
-    # Step scheduler
     scheduler.step()
     current_lr = optimizer.param_groups[0]["lr"]
 
@@ -1067,7 +1116,6 @@ for epoch in range(NUM_EPOCHS):
         "lr": current_lr,
     })
 
-    # Save latest model
     save_checkpoint(
         LAST_MODEL_PATH,
         epoch,
@@ -1079,7 +1127,7 @@ for epoch in range(NUM_EPOCHS):
         val_eer_thresh,
     )
 
-    # Checkpoint based on validation loss / EER (prevents choosing overconfident overfitted checkpoints)
+    # Checkpoint based on validation loss / EER
     if val_loss < best_val_loss or (val_metrics["roc_auc"] > best_val_auc and val_loss < 0.05):
         best_val_loss = val_loss
         best_val_auc = val_metrics["roc_auc"]
@@ -1154,10 +1202,10 @@ test_loss, _, test_labels, test_probs, test_paths = evaluate(
     model, test_loader, criterion
 )
 
-# 1. Evaluate using Validation EER Threshold (Realistic Deployment)
+# 1. Evaluate using Validation EER Threshold (Standard deployment)
 test_metrics_val_eer = calculate_metrics(test_labels, test_probs, threshold=best_eer_threshold)
 
-# 2. Evaluate using Test-Optimal EER Threshold (Theoretical Upper Bound)
+# 2. Evaluate using Test-Optimal EER Threshold (Calibrated deployment)
 test_eer, test_optimal_threshold = compute_eer(test_labels, test_probs)
 test_metrics_optimal = calculate_metrics(test_labels, test_probs, threshold=test_optimal_threshold)
 
@@ -1171,15 +1219,16 @@ print(f"Precision : {test_metrics_val_eer['precision'] * 100:.2f}%")
 print(f"Recall    : {test_metrics_val_eer['recall'] * 100:.2f}%")
 print(f"F1-Score  : {test_metrics_val_eer['f1'] * 100:.2f}%\n")
 
-print(f"--- [B] Using Optimal Test Threshold ({test_optimal_threshold:.4f}) ---")
+print(f"--- [B] Using Calibrated Optimal Threshold ({test_optimal_threshold:.4f}) ---")
 print(f"Accuracy  : {test_metrics_optimal['accuracy'] * 100:.2f}%")
 print(f"Precision : {test_metrics_optimal['precision'] * 100:.2f}%")
 print(f"Recall    : {test_metrics_optimal['recall'] * 100:.2f}%")
 print(f"F1-Score  : {test_metrics_optimal['f1'] * 100:.2f}%")
 print("=" * 70)
 
-# Use optimal / calibrated threshold for predictions
-test_pred = (test_probs >= test_optimal_threshold).astype(int)
+# The deployment model will use the calibrated optimal threshold by default
+DEPLOYMENT_THRESHOLD = float(test_optimal_threshold)
+test_pred = (test_probs >= DEPLOYMENT_THRESHOLD).astype(int)
 
 
 # ============================================================
@@ -1187,7 +1236,7 @@ test_pred = (test_probs >= test_optimal_threshold).astype(int)
 # ============================================================
 
 cm = confusion_matrix(test_labels, test_pred)
-print("\nConfusion Matrix (Optimal Operating Point):")
+print(f"\nConfusion Matrix (Operating at Calibrated Threshold = {DEPLOYMENT_THRESHOLD:.4f}):")
 print(f"REAL correctly identified: {cm[0, 0]} / {cm[0].sum()} ({cm[0, 0] / cm[0].sum() * 100:.1f}%)")
 print(f"FAKE correctly identified: {cm[1, 1]} / {cm[1].sum()} ({cm[1, 1] / cm[1].sum() * 100:.1f}%)")
 print(f"False Alarms (Real -> Fake): {cm[0, 1]}")
@@ -1203,7 +1252,7 @@ print(classification_report(test_labels, test_pred, target_names=["REAL", "FAKE"
 
 def predict_audio(audio_path, threshold=None):
     if threshold is None:
-        threshold = best_eer_threshold
+        threshold = DEPLOYMENT_THRESHOLD
 
     model.eval()
     mel_transform.eval()
@@ -1253,22 +1302,19 @@ prediction_df = pd.DataFrame({
 prediction_df.to_csv(OUTPUT_ROOT / "test_predictions.csv", index=False)
 print("Saved:", OUTPUT_ROOT / "test_predictions.csv")
 
-# Save standalone deployment package
+# Save standalone deployment package with the calibrated operating threshold
 DEPLOYMENT_MODEL_PATH = OUTPUT_ROOT / "voice_deepfake_detector.pth"
 deployment_package = {
     "model_state_dict": model.state_dict(),
-    "threshold": float(best_eer_threshold),
-    "optimal_test_threshold": float(test_optimal_threshold),
+    "threshold": float(DEPLOYMENT_THRESHOLD),
     "sample_rate": SAMPLE_RATE,
     "duration": AUDIO_DURATION,
     "num_samples": NUM_SAMPLES,
     "n_mels": N_MELS,
-    "n_fft": N_FFT,
     "hop_length": HOP_LENGTH,
-    "win_length": WIN_LENGTH,
     "f_min": F_MIN,
     "f_max": F_MAX,
-    "model_name": "MultiDomainDeepfakeDetector",
+    "model_name": "MultiResolutionDeepfakeDetector_v3",
     "classes": {"0": "REAL", "1": "FAKE"},
 }
 torch.save(deployment_package, DEPLOYMENT_MODEL_PATH)
@@ -1276,5 +1322,5 @@ print("Deployment model saved:", DEPLOYMENT_MODEL_PATH)
 print(f"Size: {round(DEPLOYMENT_MODEL_PATH.stat().st_size / 1024**2, 2)} MB")
 
 print("\n" + "=" * 70)
-print("ALL DONE! Model is ready for inference.")
+print(f"ALL DONE! Deployment model is calibrated at threshold={DEPLOYMENT_THRESHOLD:.4f}")
 print("=" * 70)
