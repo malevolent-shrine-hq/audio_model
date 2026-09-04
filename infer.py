@@ -241,7 +241,7 @@ def run_inference(audio_path, model_path=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Locate checkpoint
-    if model_path is None:
+    if model_path is None or str(model_path).endswith(".json"):
         possible_paths = [
             Path("./trained_models/voice_deepfake_detector.pth"),
             Path("/kaggle/working/voice_deepfake_detector/voice_deepfake_detector.pth"),
@@ -303,10 +303,24 @@ def run_inference(audio_path, model_path=None):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python infer.py path/to/audio.wav [path/to/checkpoint.pth]")
-        sys.exit(1)
+    # Filter out IPython/Jupyter kernel arguments (e.g. -f /root/.../kernel-1234.json)
+    args = [
+        a for a in sys.argv[1:]
+        if not a.startswith("-") and not a.endswith(".json")
+    ]
 
-    audio_file = sys.argv[1]
-    ckpt_file = sys.argv[2] if len(sys.argv) > 2 else None
-    run_inference(audio_file, ckpt_file)
+    if len(args) == 0:
+        print("\n" + "=" * 60)
+        print("Voice Deepfake Detector — Inference Mode")
+        print("=" * 60)
+        print("Usage in Terminal:")
+        print("    python infer.py path/to/audio.wav [path/to/model.pth]\n")
+        print("Usage in Jupyter / Kaggle Notebook:")
+        print("    from infer import run_inference")
+        print("    result = run_inference('path/to/sample.wav')")
+        print("=" * 60 + "\n")
+    else:
+        audio_file = args[0]
+        ckpt_file = args[1] if len(args) > 1 and args[1].endswith((".pth", ".pt")) else None
+        run_inference(audio_file, ckpt_file)
+
