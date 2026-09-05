@@ -1,0 +1,17 @@
+# Voice Deepfake Detector — Python Dependencies
+
+# Core Deep Learning & Tensor Operations
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Audio Processing & Signal Analysis
+soundfile>=0.12.1
+scipy>=1.10.0
+numpy>=1.24.0
+
+# Evaluation & Metrics (Training & Benchmarking)
+scikit-learn>=1.2.0
+pandas>=2.0.0
+
+# Optional: Dataset Download (for Kaggle / local dataset download)
+kagglehub>=0.2.0
