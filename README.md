@@ -293,7 +293,7 @@ Mixup forces the model to establish smooth, convex decision boundaries in the la
 
 ### 5.3 Optimization & Cyclic Learning Rate Dynamics
 
-- **Optimizer**: AdamW ($\beta_1 = 0.9, \beta_2 = 0.999, \text{weight\_decay} = 0.01$).
+- **Optimizer**: AdamW ($\beta_1 = 0.9$, $\beta_2 = 0.999$, $\text{weight decay} = 0.01$).
 - **Maximum Learning Rate**: $\eta_{\text{max}} = 2 \times 10^{-4}$.
 - **Scheduler**: OneCycleLR with linear warm-up over the first 20% of training, followed by cosine annealing down to $\eta_{\text{min}} = 2 \times 10^{-7}$.
 - **Gradient Clipping**: Strict norm threshold $\|\mathbf{g}\|_2 \le 1.0$ to prohibit exploding gradients on abrupt unvoiced audio transients.
@@ -604,5 +604,5 @@ This research and model training utilizes the Fake-or-Real (FoR) benchmark datas
 ---
 
 <p align="center">
-  <b>Developed with ❤️ by the Malevolent Shrine HQ AI Research Team</b>
+  <b>Developed with ❤️ by aditya and bimbok</b>
 </p>
