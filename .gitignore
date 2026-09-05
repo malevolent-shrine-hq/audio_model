@@ -7,3 +7,7 @@ checkpoints/
 # Allow tracking trained deployment models
 !trained_models/
 !trained_models/*
+venv/
+.venv/
+.python-version
+*.log
